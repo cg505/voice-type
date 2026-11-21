@@ -12,11 +12,15 @@ import (
 	"unicode"
 )
 
-// Config holds the four user-facing settings. Unknown fields are ignored so
+// Config holds the six user-facing settings. Unknown fields are ignored so
 // older config files keep loading.
 type Config struct {
 	APIKey string
-	Port   int
+	// XAIKey and VercelKey are needed only by a streaming model: xAI's own,
+	// or one served through the Vercel AI Gateway.
+	XAIKey    string
+	VercelKey string
+	Port      int
 	// Model is an sttModels ID. Vocabulary travels with the audio, so names
 	// come out spelled right instead of being corrected afterwards.
 	Model string
@@ -40,6 +44,17 @@ type vocabLists []vocabList
 type vocabList struct {
 	Name  string
 	Terms []string
+}
+
+// empty reports whether no list holds a term. The installer's template
+// declares an empty general list, which is not a vocabulary yet.
+func (v vocabLists) empty() bool {
+	for _, list := range v {
+		if len(list.Terms) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (v vocabLists) index(name string) int {
@@ -75,6 +90,9 @@ const (
 	// biasPhraseList is Azure keyword biasing -- terms, not prose, weighted
 	// during decoding. There is no prompt to echo.
 	biasPhraseList
+	// biasKeyterm is xAI keyterm biasing: terms as repeated query parameters,
+	// at most 100 of at most 50 characters. No prompt to echo.
+	biasKeyterm
 )
 
 // sttSpec is one allowed model. Provider names the provider.options namespace;
@@ -86,7 +104,14 @@ type sttSpec struct {
 	Bias       sttBias
 	USDPerHour float64
 	FallbackID string
+	// Stream is the live service of a model that types while the user speaks.
+	// Such a model never goes through sttClient, and through the gateway its
+	// Provider is the providerOptions namespace there.
+	Stream streamService
 }
+
+// Streams reports whether the model types live.
+func (s sttSpec) Streams() bool { return s.Stream != streamNone }
 
 type sttRoute struct {
 	Primary  sttSpec
@@ -109,6 +134,12 @@ var sttModels = []sttSpec{
 	{ID: "gpt-4o-mini-transcribe", Slug: "openai/gpt-4o-mini-transcribe", Provider: "openai", Bias: biasPrompt, USDPerHour: 0.111},
 	{ID: "parakeet-v3", Slug: "nvidia/parakeet-tdt-0.6b-v3", Provider: "together", Bias: biasNone, USDPerHour: 0.090},
 	{ID: "whisper-large-v3-turbo-groq", Slug: "openai/whisper-large-v3-turbo", Provider: "groq", Bias: biasNone, USDPerHour: 0.012},
+	// The price is the figure third-party research gives; xAI's own pages do
+	// not confirm it.
+	{ID: "grok-voice-transcribe-2.0", Slug: "grok-voice-transcribe-2.0", Provider: "xai", Bias: biasKeyterm, USDPerHour: 0.200, Stream: streamXAI},
+	// Vercel's catalog lists no price for it; this is the rate its launch
+	// coverage quoted. It takes a language hint and no vocabulary at all.
+	{ID: "mai-transcribe-2-streaming", Slug: "microsoft/mai-transcribe-2-streaming", Provider: "azure", Bias: biasNone, USDPerHour: 0.540, Stream: streamGateway},
 }
 
 func sttLookup(id string) (sttSpec, bool) {
@@ -142,6 +173,11 @@ func validateSTTCatalog(models []sttSpec) error {
 		if model.FallbackID == "" {
 			continue
 		}
+		// A failed stream falls back to batch at stop instead (batchSpec), and
+		// sttClient could not send a streaming model anything anyway.
+		if model.Streams() {
+			return fmt.Errorf("streaming STT model %q cannot have a fallback", model.ID)
+		}
 		if model.FallbackID == model.ID {
 			return fmt.Errorf("STT model %q falls back to itself", model.ID)
 		}
@@ -173,6 +209,16 @@ func configDefaults() Config {
 
 // modelSpec is always found: validation only ever stores an allowlisted ID.
 func (c Config) modelSpec() sttSpec { m, _ := sttLookup(c.Model); return m }
+
+// batchSpec is the model the batch client uses: the configured one, or the
+// catalog default when the configured one streams and the stream fails.
+func (c Config) batchSpec() sttSpec {
+	if spec := c.modelSpec(); !spec.Streams() {
+		return spec
+	}
+	m, _ := sttLookup(defaultModelID)
+	return m
+}
 
 // workspaces lists the switchable workspaces -- everything but general -- in the
 // order the config file declares them, which is the order the user reads.
@@ -419,7 +465,7 @@ func configWarn(field, reason string) {
 	logf("CONFIG", "%s: %s", field, reason)
 }
 
-// configValidate applies the four known fields over the defaults, warning about
+// configValidate applies the six known fields over the defaults, warning about
 // (and then ignoring) values of the wrong type or out of range. Every other
 // field is not touched at all, so both v4 configs and configs written by
 // earlier v5 installers load cleanly.
@@ -448,6 +494,28 @@ func configValidate(raw map[string]json.RawMessage) Config {
 	}
 	configWarn("api_key", apiKeyWarning)
 
+	xaiKeyWarning := ""
+	if v, ok := raw["xai_api_key"]; ok {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			cfg.XAIKey = s
+		} else {
+			xaiKeyWarning = "must be a string, using default"
+		}
+	}
+	configWarn("xai_api_key", xaiKeyWarning)
+
+	vercelKeyWarning := ""
+	if v, ok := raw["vercel_api_key"]; ok {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			cfg.VercelKey = s
+		} else {
+			vercelKeyWarning = "must be a string, using default"
+		}
+	}
+	configWarn("vercel_api_key", vercelKeyWarning)
+
 	modelWarning := ""
 	if v, ok := raw["model"]; ok {
 		var s string
@@ -471,7 +539,7 @@ func configValidate(raw map[string]json.RawMessage) Config {
 	}
 
 	// A vocabulary the model discards is billed on every dictation for nothing.
-	if spec := cfg.modelSpec(); len(cfg.Vocabulary) > 0 && !spec.TakesVocabulary() {
+	if spec := cfg.modelSpec(); !cfg.Vocabulary.empty() && !spec.TakesVocabulary() {
 		vocabularyWarning = spec.ID + " ignores it -- see `voice-type models`"
 	}
 	configWarn("vocabulary", vocabularyWarning)
@@ -527,4 +595,29 @@ func configAPIKey(cfg Config) string {
 		return k
 	}
 	return cfg.APIKey
+}
+
+// configXAIKey prefers the environment over the config file, like configAPIKey.
+func configXAIKey(cfg Config) string {
+	if k := os.Getenv("XAI_API_KEY"); k != "" {
+		return k
+	}
+	return cfg.XAIKey
+}
+
+// configVercelKey prefers the environment, under the name Vercel's own tools
+// read, over the config file.
+func configVercelKey(cfg Config) string {
+	if k := os.Getenv("AI_GATEWAY_API_KEY"); k != "" {
+		return k
+	}
+	return cfg.VercelKey
+}
+
+// configStreamKey is the key the configured model's stream is opened with.
+func configStreamKey(cfg Config) string {
+	if cfg.modelSpec().Stream == streamGateway {
+		return configVercelKey(cfg)
+	}
+	return configXAIKey(cfg)
 }

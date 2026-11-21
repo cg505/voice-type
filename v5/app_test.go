@@ -74,7 +74,8 @@ func TestPrintModelsListsAllowlistAndDefault(t *testing.T) {
 	}
 	defaultLine := ""
 	for _, line := range strings.Split(got, "\n") {
-		if strings.HasPrefix(line, defaultModelID) {
+		// The first field, not a prefix: mai-transcribe-2-streaming starts the same way.
+		if fields := strings.Fields(line); len(fields) > 0 && fields[0] == defaultModelID {
 			defaultLine = line
 		}
 	}
@@ -267,5 +268,143 @@ func TestPrintConfigCountsTheActiveVocabulary(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "vocabulary: 5 terms (general + project-one)") {
 		t.Errorf("output = %s", out.String())
+	}
+}
+
+func TestPrintConfigShowsXAIKeyAndBatchFallback(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", home)
+	t.Setenv("XAI_API_KEY", "")
+	config := `{
+    "xai_api_key": "xai-file-secret",
+    "model": "grok-voice-transcribe-2.0"
+}`
+	if err := os.WriteFile(filepath.Join(home, "voice-type.jsonc"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	show := func() string {
+		t.Helper()
+		var out bytes.Buffer
+		if err := printConfig(&out); err != nil {
+			t.Fatalf("printConfig: %v", err)
+		}
+		if strings.Contains(out.String(), "xai-file-secret") {
+			t.Errorf("output exposed the xAI key:\n%s", out.String())
+		}
+		return out.String()
+	}
+
+	t.Setenv("OPENROUTER_API_KEY", "")
+	got := show()
+	for _, want := range []string{
+		"api_key:    MISSING\nxai_key:    set (from config file)\nport:",
+		"model:      grok-voice-transcribe-2.0  ($0.200/hour, reads vocabulary, streams live)",
+		"fallback:   none (no OpenRouter key)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output lacks %q:\n%s", want, got)
+		}
+	}
+
+	t.Setenv("OPENROUTER_API_KEY", "sk-or-environment-secret")
+	t.Setenv("XAI_API_KEY", "xai-environment-secret")
+	got = show()
+	for _, want := range []string{
+		"xai_key:    set (from XAI_API_KEY)",
+		"fallback:   " + defaultModelID + " (batch, when the stream fails)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "environment-secret") {
+		t.Errorf("output exposed a key:\n%s", got)
+	}
+}
+
+// A gateway model shows the gateway's key, not xAI's, and says that its
+// vocabulary goes nowhere.
+func TestPrintConfigShowsVercelKeyForGatewayModel(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", home)
+	t.Setenv("XAI_API_KEY", "xai-environment-secret")
+	t.Setenv("AI_GATEWAY_API_KEY", "")
+	t.Setenv("OPENROUTER_API_KEY", "")
+	config := `{
+    "vercel_api_key": "vck-file-secret",
+    "model": "mai-transcribe-2-streaming"
+}`
+	if err := os.WriteFile(filepath.Join(home, "voice-type.jsonc"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	show := func() string {
+		t.Helper()
+		var out bytes.Buffer
+		if err := printConfig(&out); err != nil {
+			t.Fatalf("printConfig: %v", err)
+		}
+		if strings.Contains(out.String(), "secret") {
+			t.Errorf("output exposed a key:\n%s", out.String())
+		}
+		return out.String()
+	}
+
+	got := show()
+	for _, want := range []string{
+		"api_key:    MISSING\nvercel_key: set (from config file)\nport:",
+		"model:      mai-transcribe-2-streaming  ($0.540/hour, ignores vocabulary, streams live)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "xai_key") {
+		t.Errorf("a gateway model's output mentions the xAI key:\n%s", got)
+	}
+
+	t.Setenv("AI_GATEWAY_API_KEY", "vck-environment-secret")
+	if got := show(); !strings.Contains(got, "vercel_key: set (from AI_GATEWAY_API_KEY)") {
+		t.Errorf("output lacks the environment key:\n%s", got)
+	}
+}
+
+// A batch model's output is exactly what it was before streaming existed.
+func TestPrintConfigBatchModelHasNoXAILine(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", home)
+	t.Setenv("XAI_API_KEY", "xai-environment-secret")
+	t.Setenv("AI_GATEWAY_API_KEY", "vck-environment-secret")
+	var out bytes.Buffer
+	if err := printConfig(&out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "xai_key") || strings.Contains(out.String(), "vercel_key") || strings.Contains(out.String(), "streams live") {
+		t.Errorf("batch model output mentions streaming:\n%s", out.String())
+	}
+}
+
+func TestPrintModelsShowsLiveColumn(t *testing.T) {
+	var out bytes.Buffer
+	printModels(&out)
+	lines := strings.Split(out.String(), "\n")
+	header := lines[0]
+	live := strings.Index(header, "live")
+	if live < 0 || live < strings.Index(header, "vocabulary") || live > strings.Index(header, "fallback") {
+		t.Fatalf("header lacks a live column between vocabulary and fallback: %q", header)
+	}
+	for _, line := range lines[1:] {
+		if line == "" {
+			continue
+		}
+		model, _ := sttLookup(strings.Fields(line)[0])
+		want := "no"
+		if model.Streams() {
+			want = "yes"
+		}
+		if got := strings.TrimSpace(line[live : live+4]); got != want {
+			t.Errorf("%s: live = %q, want %q", model.ID, got, want)
+		}
 	}
 }

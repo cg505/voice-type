@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const sttEndpoint = "https://openrouter.ai/api/v1/audio/transcriptions"
@@ -291,9 +292,13 @@ func (c *sttClient) transcribeOnce(ctx context.Context, model sttSpec, wav []byt
 	}, nil
 }
 
+// truncate caps s at n bytes, backing up so that no rune is cut in half.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }

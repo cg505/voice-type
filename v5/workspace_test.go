@@ -6,14 +6,36 @@ import (
 	"testing"
 )
 
-// TestMain points XDG_STATE_HOME at a scratch directory for the whole package:
-// no test should read -- or switch -- the workspace of the machine running it.
+// realConfigPath is the config file of the machine running the tests, resolved
+// before TestMain hides it.
+var realConfigPath string
+
+// realConfig is that file's configuration, for the opt-in live tests.
+func realConfig(t *testing.T) Config {
+	t.Helper()
+	data, err := os.ReadFile(realConfigPath)
+	if err != nil {
+		return configValidate(nil)
+	}
+	cfg, err := configParse(data)
+	if err != nil {
+		t.Fatalf("%s: %v", realConfigPath, err)
+	}
+	return cfg
+}
+
+// TestMain points XDG_STATE_HOME and XDG_CONFIG_HOME at a scratch directory for
+// the whole package: no test should read -- or switch -- the workspace of the
+// machine running it, and a session started by a test must not pick up that
+// machine's model and keys (a streaming model there would dial xAI).
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "voice-type-state-")
 	if err != nil {
 		panic(err)
 	}
+	realConfigPath = configFilePath()
 	os.Setenv("XDG_STATE_HOME", dir)
+	os.Setenv("XDG_CONFIG_HOME", dir)
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)

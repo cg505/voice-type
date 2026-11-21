@@ -1,6 +1,8 @@
 package voicetype
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -253,7 +255,7 @@ func TestConfigFilePathHonoursXDG(t *testing.T) {
 
 // The real config on this machine is a v4 file; it must load cleanly.
 func TestConfigLoadRealFileIfPresent(t *testing.T) {
-	path := configFilePath()
+	path := realConfigPath
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Skipf("no config at %s", path)
@@ -373,5 +375,233 @@ func TestConfigVocabularyDuplicateKey(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cfg.Vocabulary, want) {
 		t.Errorf("got %#v, want %#v", cfg.Vocabulary, want)
+	}
+}
+
+func TestConfigXAIKeyPrefersEnv(t *testing.T) {
+	cfg, err := configParse([]byte(`{"xai_api_key": "from-file"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XAI_API_KEY", "from-env")
+	if got := configXAIKey(cfg); got != "from-env" {
+		t.Errorf("got %q, want from-env", got)
+	}
+	t.Setenv("XAI_API_KEY", "")
+	if got := configXAIKey(cfg); got != "from-file" {
+		t.Errorf("got %q, want from-file", got)
+	}
+}
+
+func TestConfigXAIKeyRejectsNonString(t *testing.T) {
+	lastWarning = sync.Map{}
+	t.Cleanup(func() { lastWarning = sync.Map{} })
+
+	cfg, err := configParse([]byte(`{"xai_api_key": 42}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.XAIKey != "" {
+		t.Errorf("non-string xai_api_key kept as %q", cfg.XAIKey)
+	}
+	if _, warned := lastWarning.Load("xai_api_key"); !warned {
+		t.Error("a non-string xai_api_key did not warn")
+	}
+}
+
+func TestConfigVercelKeyPrefersEnv(t *testing.T) {
+	cfg, err := configParse([]byte(`{"vercel_api_key": "from-file", "xai_api_key": "xai-from-file"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AI_GATEWAY_API_KEY", "from-env")
+	if got := configVercelKey(cfg); got != "from-env" {
+		t.Errorf("got %q, want from-env", got)
+	}
+	t.Setenv("AI_GATEWAY_API_KEY", "")
+	if got := configVercelKey(cfg); got != "from-file" {
+		t.Errorf("got %q, want from-file", got)
+	}
+
+	// The stream is opened with the key of the service the model is on.
+	t.Setenv("XAI_API_KEY", "")
+	cfg.Model = "mai-transcribe-2-streaming"
+	if got := configStreamKey(cfg); got != "from-file" {
+		t.Errorf("gateway model's stream key = %q, want the Vercel key", got)
+	}
+	cfg.Model = "grok-voice-transcribe-2.0"
+	if got := configStreamKey(cfg); got != "xai-from-file" {
+		t.Errorf("xAI model's stream key = %q, want the xAI key", got)
+	}
+}
+
+func TestConfigVercelKeyRejectsNonString(t *testing.T) {
+	lastWarning = sync.Map{}
+	t.Cleanup(func() { lastWarning = sync.Map{} })
+
+	cfg, err := configParse([]byte(`{"vercel_api_key": 42}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VercelKey != "" {
+		t.Errorf("non-string vercel_api_key kept as %q", cfg.VercelKey)
+	}
+	if _, warned := lastWarning.Load("vercel_api_key"); !warned {
+		t.Error("a non-string vercel_api_key did not warn")
+	}
+}
+
+// MAI streaming takes a language hint and nothing else: a vocabulary draws
+// the "ignores it" warning and is never turned into xAI keyterms.
+func TestGatewayModelIgnoresVocabulary(t *testing.T) {
+	lastWarning = sync.Map{}
+	t.Cleanup(func() { lastWarning = sync.Map{} })
+
+	var long []string
+	for i := range xaiKeytermMax + 20 {
+		long = append(long, fmt.Sprintf("term%03d", i))
+	}
+	raw, _ := json.Marshal(map[string]any{"model": "mai-transcribe-2-streaming", "vocabulary": long})
+	cfg, err := configParse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := cfg.modelSpec()
+	if spec.Stream != streamGateway || spec.Provider != "azure" || spec.TakesVocabulary() {
+		t.Errorf("spec = %+v", spec)
+	}
+	if _, warned := lastWarning.Load("vocabulary"); !warned {
+		t.Error("a vocabulary the model ignores did not warn")
+	}
+	if got := streamVocabulary(cfg, ""); got != nil {
+		t.Errorf("stream vocabulary = %d terms, want none", len(got))
+	}
+
+	// The installer's template declares an empty list: nothing to ignore.
+	if _, err := configParse([]byte(`{"model": "mai-transcribe-2-streaming", "vocabulary": {"general": []}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, warned := lastWarning.Load("vocabulary"); warned {
+		t.Error("an empty vocabulary drew the \"ignores it\" warning")
+	}
+	if _, err := configParse(raw); err != nil {
+		t.Fatal(err)
+	}
+	newStreamClient("key", spec, streamVocabulary(cfg, ""))
+	if _, warned := lastWarning.Load("keyterm"); warned {
+		t.Error("a gateway model drew xAI's keyterm limits warning")
+	}
+}
+
+func TestShippedSTTCatalogIsValid(t *testing.T) {
+	if err := validateSTTCatalog(sttModels); err != nil {
+		t.Errorf("the shipped catalog is invalid: %v", err)
+	}
+	// Each live service is told apart by one value, and says whose key it needs.
+	for _, model := range sttModels {
+		service := model.Stream.info()
+		switch model.Stream {
+		case streamNone:
+			if model.Streams() {
+				t.Errorf("%s: a batch model reports that it streams", model.ID)
+			}
+		case streamXAI:
+			if !model.Streams() || service.keyEnv != "XAI_API_KEY" || service.keyField != "xai_api_key" || !service.levels {
+				t.Errorf("%s: xAI service = %+v", model.ID, service)
+			}
+		case streamGateway:
+			if !model.Streams() || service.keyEnv != "AI_GATEWAY_API_KEY" || service.keyField != "vercel_api_key" || service.levels || service.tailSilence != gatewayTailSilence {
+				t.Errorf("%s: gateway service = %+v", model.ID, service)
+			}
+		}
+	}
+}
+
+// xAI biases by keyterm, so a vocabulary is worth sending and must not draw
+// the "ignores it" warning.
+func TestStreamingModelReadsVocabulary(t *testing.T) {
+	lastWarning = sync.Map{}
+	t.Cleanup(func() { lastWarning = sync.Map{} })
+
+	cfg, err := configParse([]byte(`{"model": "grok-voice-transcribe-2.0", "vocabulary": ["dotool", "PipeWire"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := cfg.modelSpec()
+	if cfg.Model != "grok-voice-transcribe-2.0" || spec.Stream != streamXAI || spec.Bias != biasKeyterm || !spec.TakesVocabulary() {
+		t.Errorf("model = %q, spec = %+v", cfg.Model, spec)
+	}
+	if _, warned := lastWarning.Load("vocabulary"); warned {
+		t.Error("a keyterm model warned that it ignores the vocabulary")
+	}
+	// keyterm biasing has no prompt and no OpenRouter provider options.
+	if sttVocabularyPrompt(spec, cfg.vocabularyFor("")) != "" || sttProviderOptions(spec, cfg.vocabularyFor("")) != nil {
+		t.Error("a keyterm model produced OpenRouter vocabulary conditioning")
+	}
+}
+
+func TestSTTCatalogRejectsStreamingFallback(t *testing.T) {
+	err := validateSTTCatalog([]sttSpec{
+		{ID: "stream", Stream: streamXAI, FallbackID: "batch"},
+		{ID: "batch"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "streaming") {
+		t.Fatalf("error = %v, want a streaming model with a fallback rejected", err)
+	}
+}
+
+func TestBatchSpecFallsBackToDefaultForStreamingModel(t *testing.T) {
+	cfg := configDefaults()
+	cfg.Model = "grok-voice-transcribe-2.0"
+	if got := cfg.batchSpec(); got.ID != defaultModelID || got.Streams() {
+		t.Errorf("batchSpec for a streaming model = %+v, want %s", got, defaultModelID)
+	}
+	for _, model := range sttModels {
+		if model.Streams() {
+			continue
+		}
+		cfg.Model = model.ID
+		if got := cfg.batchSpec(); got.ID != model.ID {
+			t.Errorf("batchSpec for %s = %s, want the model itself", model.ID, got.ID)
+		}
+	}
+}
+
+func TestPreflightKeys(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	batch := configDefaults()
+	stream := configDefaults()
+	stream.Model = "grok-voice-transcribe-2.0"
+	gateway := configDefaults()
+	gateway.Model = "mai-transcribe-2-streaming"
+
+	tests := []struct {
+		name       string
+		cfg        Config
+		openrouter string
+		xai        string
+		vercel     string
+		wantErr    string
+	}{
+		{"batch with OpenRouter key", batch, "sk-or", "", "", ""},
+		{"batch without OpenRouter key", batch, "", "xai", "vck", "OPENROUTER_API_KEY"},
+		{"streaming without xAI key", stream, "sk-or", "", "vck", "XAI_API_KEY"},
+		{"streaming without OpenRouter key", stream, "", "xai", "", ""},
+		{"gateway without Vercel key", gateway, "sk-or", "xai", "", "AI_GATEWAY_API_KEY"},
+		{"gateway without OpenRouter key", gateway, "", "", "vck", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("OPENROUTER_API_KEY", tt.openrouter)
+			t.Setenv("XAI_API_KEY", tt.xai)
+			t.Setenv("AI_GATEWAY_API_KEY", tt.vercel)
+			err := preflightKeys(tt.cfg)
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("unexpected error: %v", err)
+			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
+				t.Errorf("error = %v, want one naming %s", err, tt.wantErr)
+			}
+		})
 	}
 }

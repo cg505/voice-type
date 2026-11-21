@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bendahl/uinput"
 )
@@ -16,18 +19,47 @@ type testKeyEvent struct {
 }
 
 type fakeKeyboard struct {
+	mu     sync.Mutex
 	events []testKeyEvent
 	held   map[int]bool
 	failAt int
 	calls  int
 	closed bool
+
+	// gate, when set, holds every event until the test closes it; gateEntered
+	// is signalled the first time an event waits there.
+	gate        chan struct{}
+	gateEntered chan struct{}
+	// delay slows every event, standing in for a slow keyboard.
+	delay time.Duration
 }
 
 func newFakeKeyboard() *fakeKeyboard {
 	return &fakeKeyboard{held: make(map[int]bool)}
 }
 
+// snapshot is the events so far, safe to take while another goroutine types.
+func (f *fakeKeyboard) snapshot() []testKeyEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.events)
+}
+
 func (f *fakeKeyboard) record(op string, key int) error {
+	if f.gate != nil {
+		if f.gateEntered != nil {
+			select {
+			case f.gateEntered <- struct{}{}:
+			default:
+			}
+		}
+		<-f.gate
+	}
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.events = append(f.events, testKeyEvent{op: op, key: key})
 	f.calls++
 	if f.failAt == f.calls {
@@ -48,6 +80,8 @@ func (f *fakeKeyboard) KeyUp(key int) error    { return f.record("up", key) }
 func (f *fakeKeyboard) FetchSyspath() (string, error) { return "", nil }
 
 func (f *fakeKeyboard) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.closed = true
 	return nil
 }

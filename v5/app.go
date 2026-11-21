@@ -73,9 +73,34 @@ func printConfig(w io.Writer) error {
 	if spec.TakesVocabulary() {
 		vocabulary = "reads vocabulary"
 	}
+
+	// The stream's key only matters to a streaming model, whose fallback is the
+	// batch model at stop -- and only when there is an OpenRouter key to use.
+	streamKeyLine := ""
+	if spec.Streams() {
+		service := spec.Stream.info()
+		label, inFile := "xai_key:    ", cfg.XAIKey
+		if spec.Stream == streamGateway {
+			label, inFile = "vercel_key: ", cfg.VercelKey
+		}
+		status := "MISSING"
+		switch {
+		case os.Getenv(service.keyEnv) != "":
+			status = "set (from " + service.keyEnv + ")"
+		case inFile != "":
+			status = "set (from config file)"
+		}
+		streamKeyLine = label + status + "\n"
+		vocabulary += ", streams live"
+		fallback = "none (no OpenRouter key)"
+		if configAPIKey(cfg) != "" {
+			fallback = cfg.batchSpec().ID + " (batch, when the stream fails)"
+		}
+	}
+
 	workspace := workspaceLoad()
-	_, err = fmt.Fprintf(w, "config:     %s\napi_key:    %s\nport:       %d\nmodel:      %s  ($%.3f/hour, %s)\nfallback:   %s\nvocabulary: %d terms (%s)\n",
-		configFilePath(), keyStatus, cfg.Port, spec.ID, spec.USDPerHour, vocabulary, fallback,
+	_, err = fmt.Fprintf(w, "config:     %s\napi_key:    %s\n%sport:       %d\nmodel:      %s  ($%.3f/hour, %s)\nfallback:   %s\nvocabulary: %d terms (%s)\n",
+		configFilePath(), keyStatus, streamKeyLine, cfg.Port, spec.ID, spec.USDPerHour, vocabulary, fallback,
 		len(cfg.activeVocabulary(workspace)), vocabularySources(cfg, workspace))
 	return err
 }
@@ -178,11 +203,15 @@ func runVocab(w io.Writer, args []string) error {
 }
 
 func printModels(w io.Writer) {
-	fmt.Fprintln(w, "ID                           $/hour   vocabulary  fallback")
+	fmt.Fprintln(w, "ID                           $/hour   vocabulary  live  fallback")
 	for _, model := range sttModels {
 		vocabulary := "no"
 		if model.TakesVocabulary() {
 			vocabulary = "yes"
+		}
+		live := "no"
+		if model.Streams() {
+			live = "yes"
 		}
 		defaultLabel := ""
 		if model.ID == defaultModelID {
@@ -192,7 +221,7 @@ func printModels(w io.Writer) {
 		if model.FallbackID != "" {
 			fallback = model.FallbackID
 		}
-		fmt.Fprintf(w, "%-28s %7.3f   %-10s  %-14s%s\n", model.ID, model.USDPerHour, vocabulary, fallback, defaultLabel)
+		fmt.Fprintf(w, "%-28s %7.3f   %-10s  %-4s  %-14s%s\n", model.ID, model.USDPerHour, vocabulary, live, fallback, defaultLabel)
 	}
 }
 

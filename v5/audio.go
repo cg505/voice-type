@@ -2,6 +2,7 @@ package voicetype
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -29,6 +30,10 @@ type audioRecorder interface {
 	Start() error
 	Stop() ([]int16, error)
 	Close()
+	// Samples returns a copy of everything captured since Start beyond the
+	// first from samples, or nil when there is nothing new. The streaming
+	// sender polls it; Stop still returns the whole recording.
+	Samples(from int) []int16
 }
 
 func NewRecorder() (*Recorder, error) {
@@ -96,6 +101,18 @@ func (r *Recorder) Start() error {
 	stream.Start()
 	logf("AUDIO", "recording from %s (%s)", source.Name(), source.ID())
 	return nil
+}
+
+// Samples copies rather than handing out a view: the write callback keeps
+// appending, and the copy is taken under the lock that callback already uses,
+// so the pulse read loop is never made to wait on anything slower than a copy.
+func (r *Recorder) Samples(from int) []int16 {
+	r.bufMu.Lock()
+	defer r.bufMu.Unlock()
+	if from >= len(r.samples) {
+		return nil
+	}
+	return slices.Clone(r.samples[from:])
 }
 
 // Stop ends capture and returns everything recorded during the session.
