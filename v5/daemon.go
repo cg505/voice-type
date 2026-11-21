@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // sessionState is the dictation state machine:
@@ -45,11 +46,14 @@ type daemon struct {
 	workspace string
 	res       *resources
 	stt       *sttClient
+	streamer  *streamClient
 	srv       *http.Server
 	done      chan struct{}
 
 	mu    sync.Mutex
 	state sessionState
+	// stream is the live session while a streaming model records.
+	stream *streamSession
 	// capTimer force-stops a session at the fixed duration cap.
 	capTimer      *time.Timer
 	shuttingDown  bool
@@ -68,10 +72,21 @@ func newDaemon(cfg Config, res *resources) *daemon {
 		cfg:         cfg,
 		workspace:   workspace,
 		res:         res,
-		stt:         newSTTClient(configAPIKey(cfg), cfg.modelSpec(), cfg.activeVocabulary(workspace)),
+		stt:         newSTTClient(configAPIKey(cfg), cfg.batchSpec(), cfg.activeVocabulary(workspace)),
+		streamer:    newStreamClient(configStreamKey(cfg), cfg.modelSpec(), streamVocabulary(cfg, workspace)),
 		done:        make(chan struct{}),
 		checkOnline: checkConnectivity,
 	}
+}
+
+// streamVocabulary is what a stream sends as keyterms. Only a streaming model
+// that takes them gets any, so nobody else's long list draws xAI's limits
+// warning.
+func streamVocabulary(cfg Config, workspace string) []string {
+	if spec := cfg.modelSpec(); !spec.Streams() || spec.Bias != biasKeyterm {
+		return nil
+	}
+	return cfg.activeVocabulary(workspace)
 }
 
 const connectivityURL = "https://connectivitycheck.gstatic.com/generate_204"
@@ -185,6 +200,17 @@ func (d *daemon) startSession() (int, string) {
 	}
 
 	d.state = stateRecording
+	// The dial runs inside the session, so /start answers exactly when batch
+	// mode does. Speech given while it connects waits in the recorder buffer.
+	if d.cfg.modelSpec().Streams() {
+		stream := newStreamSession(d.streamer, d.res.Recorder, d.res.Typer)
+		d.stream = stream
+		d.sessionWG.Add(1)
+		go func() {
+			defer d.sessionWG.Done()
+			stream.run(ctx)
+		}()
+	}
 	d.capTimer = time.AfterFunc(maxDurationSeconds*time.Second, func() {
 		d.stopSessionFor(sessionID)
 	})
@@ -205,6 +231,7 @@ func (d *daemon) reloadConfig() {
 	if err != nil {
 		configWarn("file", err.Error()+" -- keeping current configuration")
 		d.stt.vocabulary = d.cfg.activeVocabulary(d.workspace)
+		d.streamer.setVocabulary(streamVocabulary(d.cfg, d.workspace))
 		return
 	}
 	lastWarning.Delete("file")
@@ -212,8 +239,11 @@ func (d *daemon) reloadConfig() {
 	d.cfg = cfg
 
 	d.stt.apiKey = configAPIKey(cfg)
-	d.stt.setRoute(cfg.modelSpec())
+	d.stt.setRoute(cfg.batchSpec())
 	d.stt.vocabulary = cfg.activeVocabulary(d.workspace)
+	d.streamer.apiKey = configStreamKey(cfg)
+	d.streamer.setModel(cfg.modelSpec())
+	d.streamer.setVocabulary(streamVocabulary(cfg, d.workspace))
 }
 
 // stopSession moves recording -> transcribing -> idle. It runs on the caller's
@@ -246,6 +276,7 @@ func (d *daemon) stopSessionFor(sessionID uint64) (int, string) {
 	d.state = stateTranscribing
 	ctx := d.sessionCtx
 	stt := d.stt
+	stream := d.stream
 	if sessionID != 0 {
 		logf("AUDIO", "duration cap of %ds reached -- stopping", maxDurationSeconds)
 	}
@@ -258,6 +289,7 @@ func (d *daemon) stopSessionFor(sessionID uint64) (int, string) {
 	defer func() {
 		d.mu.Lock()
 		d.state = stateIdle
+		d.stream = nil
 		if d.sessionCancel != nil {
 			d.sessionCancel()
 		}
@@ -272,6 +304,16 @@ func (d *daemon) stopSessionFor(sessionID uint64) (int, string) {
 		logf("AUDIO", "recording discarded during shutdown")
 		return http.StatusOK, "cancelled"
 	}
+	if stream != nil {
+		return d.finishStream(ctx, stt, stream, samples, recordErr)
+	}
+	return d.finishBatch(ctx, stt, samples, recordErr)
+}
+
+// finishBatch gates, trims, uploads and pastes a finished recording. It is
+// also what a streaming dictation falls back to when the stream produced no
+// text.
+func (d *daemon) finishBatch(ctx context.Context, stt *sttClient, samples []int16, recordErr error) (int, string) {
 	if recordErr != nil {
 		logf("AUDIO", "capture failed: %v", recordErr)
 		return http.StatusInternalServerError, recordErr.Error()
@@ -296,16 +338,7 @@ func (d *daemon) stopSessionFor(sessionID uint64) (int, string) {
 		noSpeech = true
 	}
 	if noSpeech {
-		if err := d.res.Typer.TypeContext(ctx, "?"); err != nil {
-			if errors.Is(err, context.Canceled) {
-				logf("OUTPUT", "no-speech marker cancelled")
-				return http.StatusOK, "cancelled"
-			}
-			logf("OUTPUT", "no-speech marker failed: %v", err)
-			return http.StatusInternalServerError, fmt.Sprintf("no speech detected; type marker: %v", err)
-		}
-		logf("OUTPUT", "typed no-speech marker")
-		return http.StatusOK, "no speech detected"
+		return d.typeNoSpeechMarker(ctx)
 	}
 
 	samples = TrimSilence(samples)
@@ -375,6 +408,83 @@ func (d *daemon) stopSessionFor(sessionID uint64) (int, string) {
 	return http.StatusOK, result.Text
 }
 
+// typeNoSpeechMarker types the ? that tells the user nothing was heard.
+func (d *daemon) typeNoSpeechMarker(ctx context.Context) (int, string) {
+	if err := d.res.Typer.TypeContext(ctx, "?"); err != nil {
+		if errors.Is(err, context.Canceled) {
+			logf("OUTPUT", "no-speech marker cancelled")
+			return http.StatusOK, "cancelled"
+		}
+		logf("OUTPUT", "no-speech marker failed: %v", err)
+		return http.StatusInternalServerError, fmt.Sprintf("no speech detected; type marker: %v", err)
+	}
+	logf("OUTPUT", "typed no-speech marker")
+	return http.StatusOK, "no speech detected"
+}
+
+// finishStream ends a streaming dictation. Text already on screen is never
+// retracted. Unless the service confirmed it had said everything, the
+// recording is not let go: with nothing typed it goes to the batch fallback,
+// otherwise it is retained beside the log line that says why. The user hears
+// about trouble the way batch mode tells them: ? when nothing landed, the log
+// otherwise.
+func (d *daemon) finishStream(ctx context.Context, stt *sttClient, stream *streamSession, samples []int16, recordErr error) (int, string) {
+	stopped := time.Now()
+	text, streamErr, typeErr := stream.finish(ctx, samples)
+	if ctx.Err() != nil {
+		logf("STREAM", "cancelled during shutdown")
+		return http.StatusOK, "cancelled"
+	}
+
+	switch {
+	case typeErr != nil:
+		logf("OUTPUT", "live typing failed: %v%s", typeErr, retainRecording(samples))
+		return http.StatusInternalServerError, fmt.Sprintf("typing failed: %v", typeErr)
+	case recordErr != nil:
+		logf("AUDIO", "capture failed: %v%s", recordErr, retainRecording(samples))
+		return http.StatusInternalServerError, recordErr.Error()
+	case text == "":
+		reason := "no text from the stream"
+		if streamErr != nil {
+			reason = "the stream failed before any text"
+		}
+		if !worthUploading(samples) {
+			logf("STREAM", "%s, and no speech in %.2fs", reason, wavDurationSeconds(samples))
+			return d.typeNoSpeechMarker(ctx)
+		}
+		if stt.apiKey != "" {
+			logf("STREAM", "%s -- transcribing the recording in batch", reason)
+			return d.finishBatch(ctx, stt, samples, nil)
+		}
+		retained := retainRecording(samples)
+		logf("STREAM", "%s and no OpenRouter key for the batch fallback%s", reason, retained)
+		if err := d.res.Typer.TypeContext(ctx, "?"); err != nil {
+			logf("OUTPUT", "failure marker failed: %v", err)
+		}
+		return http.StatusBadGateway, reason + retained
+	case streamErr != nil:
+		retained := retainRecording(samples)
+		logf("STREAM", "failed after %d chars were typed: %v%s", utf8.RuneCountInString(text), streamErr, retained)
+		return http.StatusBadGateway, "stream failed: " + streamErr.Error() + retained
+	}
+
+	st := stream.stats()
+	logf("STREAM", "typed live in %v: %d chars, %d backspaces (max rewrite %d), %d events, %.1fs audio, reply %v: %s",
+		time.Since(stopped).Round(time.Millisecond), utf8.RuneCountInString(text), st.backspaces, st.maxRewrite, st.events,
+		st.audioSeconds, st.reply.Round(time.Millisecond), truncate(text, 120))
+	return http.StatusOK, text
+}
+
+// retainRecording keeps the raw recording and returns the log suffix saying
+// where it went.
+func retainRecording(samples []int16) string {
+	path, err := retainWAV(WavEncode(samples))
+	if err != nil {
+		return fmt.Sprintf(" (could not retain audio: %v)", err)
+	}
+	return " -- audio retained at " + path
+}
+
 // handleSTTError logs the failure at the right severity and keeps the audio
 // around rather than silently discarding speech.
 func (d *daemon) handleSTTError(err error, wav []byte) (int, string) {
@@ -419,10 +529,14 @@ func (d *daemon) routes() *http.ServeMux {
 		cfg, state, workspace := d.cfg, d.state, d.workspace
 		terms := len(cfg.vocabularyFor(workspace))
 		d.mu.Unlock()
-		route := sttRouteFor(cfg.modelSpec())
+		spec := cfg.modelSpec()
 		fallback := ""
-		if route.Fallback != nil {
+		if route := sttRouteFor(spec); route.Fallback != nil {
 			fallback = route.Fallback.ID
+		}
+		// A stream that fails before any text falls back to batch at stop.
+		if spec.Streams() && configAPIKey(cfg) != "" {
+			fallback = cfg.batchSpec().ID
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status": "ok", "state": state.String(),
@@ -487,6 +601,7 @@ func (d *daemon) shutdown() {
 			d.state = stateIdle
 			d.sessionID++
 		}
+		d.stream = nil
 		d.mu.Unlock()
 
 		if state == stateRecording {

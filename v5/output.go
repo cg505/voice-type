@@ -271,7 +271,12 @@ func (t *Typer) TypeContext(ctx context.Context, text string) error {
 	if err != nil {
 		return err
 	}
+	return t.typeStrokes(ctx, strokes)
+}
 
+// typeStrokes sends compiled strokes with the fixed timing, checking ctx
+// before every one so a cancelled session types nothing more.
+func (t *Typer) typeStrokes(ctx context.Context, strokes []keyStroke) error {
 	for i, stroke := range strokes {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -290,6 +295,16 @@ func (t *Typer) TypeContext(ctx context.Context, text string) error {
 		}
 	}
 	return nil
+}
+
+// backspaceStrokes erases n runes. One stroke per rune matches typeCompile,
+// which types one key per ASCII rune and one hex entry per other rune.
+func backspaceStrokes(n int) []keyStroke {
+	strokes := make([]keyStroke, n)
+	for i := range strokes {
+		strokes[i] = keyStroke{key: uinput.KeyBackspace}
+	}
+	return strokes
 }
 
 // Paste preserves CLIPBOARD when possible and falls back to direct typing.

@@ -31,8 +31,49 @@ service without an SLA, which is why the fallback remains enabled.
 
 Existing configurations keep their explicitly selected model during upgrades.
 Run `voice-type models` to see the available models, vocabulary support, prices,
-and fallback policy. Workspace-specific vocabulary can be selected with
-`voice-type vocab set <name>`.
+and fallback policy; `grok-voice-transcribe-2.0` and
+`mai-transcribe-2-streaming` are the ones that stream live.
+Workspace-specific vocabulary can be selected with `voice-type vocab set <name>`.
+
+## Live streaming
+
+With a streaming model, text appears in the focused window while you speak and
+is corrected in place as the transcription firms up. There are two:
+
+- **`mai-transcribe-2-streaming`**, Microsoft's model through the Vercel AI
+  Gateway. Add your gateway key as `"vercel_api_key"` (or export
+  `AI_GATEWAY_API_KEY`); the Vercel account needs a card on file. The last two
+  seconds of text are a guess that keeps being corrected; text older than that
+  does not change. It takes no vocabulary. Vercel's streaming transcription is
+  in beta.
+- **`grok-voice-transcribe-2.0`**, straight from xAI. Add your xAI key as
+  `"xai_api_key"` (or export `XAI_API_KEY`). Vocabulary lists are sent as xAI
+  keyterms (at most 100 terms of 50 characters). Audio is level-corrected
+  before it is sent, which recovers most of the sentences a quiet laptop
+  microphone would otherwise lose; it does not cope with whispering.
+
+Keep the caret and the focus where they are while a streaming dictation is
+open and until the text settles after you stop: corrections are typed as
+backspaces, and voice-type cannot see where the caret went. Finish the word
+before you stop -- one cut off by the stop press can be lost. Text that arrives
+after the stop press is typed in one go when the service has finished, a
+fraction of a second later. Use a stop key without modifiers (F9-style) all the
+same, so a held Ctrl or Alt cannot turn keystrokes already under way into
+shortcuts.
+
+Live text is typed key by key, as plain ASCII on a US keyboard layout: accents
+are dropped (café is typed cafe), typographic quotes and dashes become plain
+ones, a few symbols are spelled out (€ becomes EUR), and anything else becomes
+`?`. Batch dictations are pasted and keep their characters.
+
+If the stream cannot be opened or drops before any text has appeared, the
+dictation is still recorded and, when an OpenRouter key is configured, sent to
+OpenRouter at stop as a normal batch dictation; without one, voice-type types
+`?` and keeps the recording in `/tmp/voice-type/` (or `$TMPDIR/voice-type/`).
+If the stream drops after text has appeared, or the service does not confirm
+the end of the dictation within a few seconds of the stop, that text stays, the
+recording is kept in the same place, and the log says why. Streaming is billed
+per second of audio, pauses included; the 10-minute cap still applies.
 
 Install with
 

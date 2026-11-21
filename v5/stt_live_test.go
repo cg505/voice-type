@@ -36,7 +36,7 @@ func TestLiveTranscribe(t *testing.T) {
 	wav := WavEncode(samples)
 	t.Logf("audio: %.2fs, wav %d bytes", wavDurationSeconds(samples), len(wav))
 
-	cfg := configLoad()
+	cfg := realConfig(t)
 	if id := os.Getenv("VOICE_TYPE_MODEL"); id != "" {
 		cfg.Model = id
 	}
